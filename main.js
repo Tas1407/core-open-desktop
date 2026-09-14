@@ -325,7 +325,7 @@ function buildMenu() {
         type: 'info',
         title: 'Über MVM Core Open',
         message: 'MVM Core Open',
-        detail: 'Version ' + version + '\n\nMVM — Academy Modul by CORE OPEN\nhttps://www.mvm.school/web2app-ii/',
+        detail: 'Version ' + version + '\n\nMVM — Academy Modul by CORE OPEN',
         buttons: ['OK'],
         icon: path.join(__dirname, 'build', 'icon.ico'),
       });
