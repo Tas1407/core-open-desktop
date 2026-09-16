@@ -336,7 +336,27 @@ function buildMenu() {
     {
       label: 'Datei',
       submenu: [
-        { role: 'reload', label: 'Neu laden' },
+        {
+          label: 'Neu laden',
+          accelerator: 'CmdOrCtrl+R',
+          click: (menuItem, browserWindow, event) => {
+            const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : browserWindow;
+            if (!win) return;
+            if (event && event.shiftKey) {
+              win.webContents.reloadIgnoringCache();
+            } else {
+              win.webContents.reload();
+            }
+          },
+        },
+        {
+          label: 'Hart neu laden (Cache leeren)',
+          accelerator: 'CmdOrCtrl+Shift+R',
+          click: (menuItem, browserWindow) => {
+            const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : browserWindow;
+            if (win) win.webContents.reloadIgnoringCache();
+          },
+        },
         { role: 'togglefullscreen', label: 'Vollbild' },
         { type: 'separator' },
         { role: 'quit', label: 'Beenden' },
