@@ -8,18 +8,27 @@
  * lädt herunter, zeigt Badge, installiert beim Klick oder beim nächsten Start.
  * #243 Diagnose: Alle Updater-Events werden in update-log.txt geschrieben.
  */
-const { app, BrowserWindow, Menu, shell, Notification, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, Menu, shell, Notification, ipcMain, dialog, protocol, net } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { autoUpdater } = require('electron-updater');
+const offlineCache = require('./cache');
+const offlineSync = require('./sync');
 
 const APP_URL = 'https://www.mvm.school/web2app-ii/';
+const API_PREFIX = '/web2app-ii/api/';
 const WINDOW_TITLE = 'MVM - Academy Modul by CORE OPEN';
 
 let mainWindow = null;
 let updateOverlay = null;
 let updateDownloaded = false;
 let userRole = null; // vom Renderer nach Login gesetzt ('admin', 'teacher', etc.)
+
+// ── Offline-Lesecache (Pilot: Kurse & Schüler) ──
+let syncRunning = false;
+let forceOffline = false;      // Test-Schalter (Menü/IPC): tut so, als gäbe es kein Netz
+let onOfflinePage = false;     // true, solange offline.html statt der App geladen ist
+let offlineRetryTimer = null;
 
 // ── Update-Log in Datei (#243 Diagnose) ──
 // Schreibt alle [updater]-Events in eine Textdatei neben den App-Daten,
@@ -167,6 +176,7 @@ ipcMain.on('set-user-role', (_event, role) => {
   logUpdate('[app] Rolle vom Renderer gemeldet: ' + (role || '(leer)'));
   userRole = role || null;
   buildMenu(); // Menü neu aufbauen — DevTools nur für Admins
+  startOfflineSync('login');   // Frischer Login → Datenbestand ziehen
 });
 
 // ── IPC: Renderer löst manuellen Update-Check aus ──
@@ -242,6 +252,166 @@ function manualUpdateCheck() {
   });
 }
 
+// ── Offline-Lesecache: Sync + Interceptor ────────────────────────────
+// Phase 1 (nur Lesen): Beim Start/Login wird der Kurse-&-Schüler-
+// Datensatz des eingeloggten Lehrers komplett gezogen und der lokale
+// JSON-Cache ersetzt. Läuft die App ohne Netz, werden API-GETs aus dem
+// Cache beantwortet; die Seite sieht ein "Offline — Stand vom"-Banner.
+
+function sendToPage(channel, data) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    try { mainWindow.webContents.send(channel, data); } catch (_) {}
+  }
+}
+
+function startOfflineSync(reason) {
+  if (syncRunning) return;
+  syncRunning = true;
+  logUpdate('[sync] Start (' + reason + ')');
+  sendToPage('mvm-sync', { state: 'start' });
+  const t0 = Date.now();
+  offlineSync.syncKurseSchueler((p) => {
+    sendToPage('mvm-sync', Object.assign({ state: 'progress' }, p));
+  }).then((r) => {
+    if (r.ok) {
+      logUpdate(`[sync] Fertig in ${r.ms} ms — ${r.entries} Endpunkte, ${r.kurse} Kurse, ${r.schueler} Schueler, ~${Math.round(r.bytes / 1024)} KB`);
+      sendToPage('mvm-sync', { state: 'done', ms: r.ms, entries: r.entries });
+    } else {
+      logUpdate('[sync] Abgebrochen: ' + (r.note || '?') + ' nach ' + r.ms + ' ms');
+      sendToPage('mvm-sync', { state: 'skipped', note: r.note });
+    }
+  }).catch((e) => {
+    logUpdate('[sync] FEHLER: ' + (e && e.message ? e.message : String(e)));
+    sendToPage('mvm-sync', { state: 'error' });
+  }).finally(() => { syncRunning = false; });
+}
+
+/**
+ * API-GETs der Web-App abfangen: online → normal durchreichen (und
+ * bekannte Cache-Eintraege nebenbei auffrischen), offline/fehlgeschlagen
+ * → aus dem Cache beantworten. Nur Lesen — andere Requests und alles
+ * ausserhalb von /web2app-ii/api/ gehen unangetastet durch.
+ */
+function setupOfflineInterceptor() {
+  protocol.handle('https', async (req) => {
+    let u;
+    try { u = new URL(req.url); } catch (_) { return net.fetch(req, { bypassCustomProtocolHandlers: true }); }
+
+    const isApiGet = req.method === 'GET'
+      && u.hostname === 'www.mvm.school'
+      && u.pathname.startsWith(API_PREFIX);
+
+    if (!isApiGet) {
+      if (forceOffline) {
+        // Bei simulierter Offline-Navigation direkt die lokale Seite zeigen.
+        // Requests in protocol.handle tragen keine fetch()-mode/destination —
+        // zuverlaessigste Erkennung: sec-fetch-dest-Header oder der App-Pfad.
+        const nav = req.mode === 'navigate' || req.destination === 'document'
+          || req.headers.get('sec-fetch-mode') === 'navigate'
+          || req.headers.get('sec-fetch-dest') === 'document'
+          || u.pathname === '/web2app-ii/' || u.pathname === '/web2app-ii/index.php';
+        if (nav) setTimeout(showOfflinePage, 0);
+        return new Response('offline (simuliert)', { status: 503 });
+      }
+      return net.fetch(req, { bypassCustomProtocolHandlers: true });
+    }
+
+    const key = u.pathname.slice(API_PREFIX.length - 'api/'.length) + u.search;
+
+    if (!forceOffline) {
+      try {
+        const res = await net.fetch(req, { bypassCustomProtocolHandlers: true });
+        // Read-through: schon gecachte Endpunkte online auffrischen
+        if (res.ok && offlineCache.has(key)) {
+          res.clone().text()
+            .then((t) => offlineCache.put(key, t))
+            .catch(() => {});
+        }
+        return res;
+      } catch (e) {
+        logUpdate('[offline] Netzfehler bei ' + key + ' — versuche Cache');
+      }
+    }
+
+    let body = offlineCache.get(key);
+    // Gefilterte Schuelerliste offline: ungefilterte Liste ausliefern
+    // (lieber alle Schueler als keine — Client zeigt dann alles).
+    if (body === null && /^api\/students\.php\?.*action=list/.test(key)) {
+      body = offlineCache.get('api/students.php?action=list');
+    }
+    if (body !== null) {
+      sendToPage('mvm-offline', { stand: offlineCache.stand() });
+      return new Response(body, {
+        status: 200,
+        headers: { 'Content-Type': 'application/json; charset=utf-8', 'x-mvm-cache': '1' },
+      });
+    }
+    sendToPage('mvm-offline', { stand: offlineCache.stand() });
+    return new Response(JSON.stringify({ success: false, error: 'Offline — nicht im Lesecache', _offline: true }), {
+      status: 503,
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    });
+  });
+}
+
+// ── Lokale Offline-Seite (ganz ohne Netz beim Start) ──
+function showOfflinePage() {
+  if (!mainWindow || mainWindow.isDestroyed() || onOfflinePage) return;
+  if (!offlineCache.stand()) return; // ohne Cache gibt's nichts anzuzeigen → Chrome-Fehlerseite stehen lassen
+  onOfflinePage = true;
+  logUpdate('[offline] Kein Netz — zeige offline.html (Stand ' + offlineCache.stand() + ')');
+  mainWindow.loadFile(path.join(__dirname, 'offline.html'));
+  if (!offlineRetryTimer) {
+    offlineRetryTimer = setInterval(() => {
+      if (net.isOnline() && onOfflinePage) maybeLeaveOfflinePage();
+    }, 15000);
+  }
+}
+
+function maybeLeaveOfflinePage(force) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const onFile = mainWindow.webContents.getURL().startsWith('file://');
+  if (!force && !onOfflinePage && !onFile) return;
+  onOfflinePage = false;
+  if (offlineRetryTimer) { clearInterval(offlineRetryTimer); offlineRetryTimer = null; }
+  mainWindow.loadURL(APP_URL);
+}
+
+// IPC: offline.html holt den gecachten Datenstand
+ipcMain.handle('offline-data', () => {
+  const c = offlineCache.load();
+  const out = { stand: c.meta.savedAt || null, kurse: [] };
+  const listEntry = c.entries['api/courses.php?action=list'];
+  if (listEntry) {
+    try {
+      const j = JSON.parse(listEntry.body);
+      for (const k of (j.courses || [])) {
+        const name = k.name || k.KURS || '?';
+        const stKey = `api/courses.php?action=students&kurs=${encodeURIComponent(name)}`;
+        const stE = c.entries[stKey];
+        let schueler = [];
+        if (stE) {
+          try {
+            const sj = JSON.parse(stE.body);
+            schueler = (sj.students || sj.data || []).map((s) =>
+              ((s.firstName || s.vorname || '') + ' ' + (s.lastName || s.nachname || '')).trim());
+          } catch (_) {}
+        }
+        out.kurse.push({ name, schueler });
+      }
+    } catch (_) {}
+  }
+  return out;
+});
+
+ipcMain.on('offline-retry', () => { maybeLeaveOfflinePage(true); });
+
+// Test-Haken: "Offline simulieren" (Menue Hilfe — nur sichtbar wenn aktiv)
+ipcMain.on('debug-force-offline', (_e, val) => {
+  forceOffline = !!val;
+  logUpdate('[offline] forceOffline = ' + forceOffline);
+});
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1280,
@@ -263,6 +433,26 @@ function createWindow() {
   // Fenster erst zeigen wenn Inhalt geladen ist (vermeidet weißen Flash)
   mainWindow.once('ready-to-show', () => {
     mainWindow.show();
+  });
+
+  // Offline-Cache: nach jedem erfolgreichen App-Load Sync anstossen
+  // (Sync selbst prueft die Session — ohne Login bricht er sofort ab).
+  let syncTimer = null;
+  mainWindow.webContents.on('did-finish-load', () => {
+    const url = mainWindow.webContents.getURL();
+    if (!url.startsWith(APP_URL)) return;
+    if (syncTimer) clearTimeout(syncTimer);
+    syncTimer = setTimeout(() => startOfflineSync('app-load'), 1500);
+  });
+
+  // Ganz ohne Netz beim Start: lokale Offline-Seite mit dem letzten
+  // Cache-Stand zeigen statt Chromes Fehlerseite.
+  mainWindow.webContents.on('did-fail-load', (_e, errorCode, errorDesc, url) => {
+    const netzFehler = ['ERR_INTERNET_DISCONNECTED', 'ERR_NAME_NOT_RESOLVED',
+      'ERR_CONNECTION_FAILED', 'ERR_CONNECTION_TIMED_OUT', 'ERR_ADDRESS_UNREACHABLE'];
+    if (netzFehler.includes(errorDesc) || netzFehler.includes(String(errorCode))) {
+      showOfflinePage();
+    }
   });
 
   // Externe Links im Standard-Browser öffnen, nicht im App-Fenster
@@ -359,6 +549,21 @@ function buildMenu() {
         },
         { role: 'togglefullscreen', label: 'Vollbild' },
         { type: 'separator' },
+        {
+          label: 'Offline-Daten neu laden',
+          accelerator: 'CmdOrCtrl+D',
+          click: () => { startOfflineSync('manuell'); },
+        },
+        {
+          label: 'Offline simulieren',
+          type: 'checkbox',
+          checked: forceOffline,
+          click: (item) => {
+            forceOffline = item.checked;
+            logUpdate('[offline] forceOffline = ' + forceOffline + ' (Menue)');
+          },
+        },
+        { type: 'separator' },
         { role: 'quit', label: 'Beenden' },
       ],
     },
@@ -372,6 +577,9 @@ function buildMenu() {
 
 // ── App-Lifecycle ──
 app.whenReady().then(() => {
+  // Offline-Lesecache: API-Interceptor muss vor dem ersten Request stehen
+  setupOfflineInterceptor();
+
   buildMenu();
   createWindow();
   setupAutoUpdater();

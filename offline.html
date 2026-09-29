@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'">
+  <title>MVM — Offline</title>
+  <style>
+    body { font: 14px/1.5 system-ui, sans-serif; background: #10141d; color: #dce4f2; margin: 0; }
+    .banner { background: #7a4b00; color: #ffe9c4; text-align: center; padding: 10px; font-size: 15px; }
+    .wrap { max-width: 720px; margin: 24px auto; padding: 0 16px; }
+    h1 { font-size: 18px; font-weight: 600; }
+    .kurs { background: #1a2030; border: 1px solid #2a3550; border-radius: 8px; margin-bottom: 10px; }
+    .kurs > summary { padding: 10px 14px; cursor: pointer; font-weight: 600; }
+    .kurs ul { margin: 0; padding: 4px 14px 12px 30px; color: #aebadd; }
+    .kurs .n { color: #7c8db5; font-weight: 400; font-size: 12px; margin-left: 8px; }
+    button { background: #2c4a8a; color: #fff; border: 0; border-radius: 6px; padding: 8px 16px; cursor: pointer; font-size: 14px; }
+    button:hover { background: #3a5cab; }
+    .hint { color: #7c8db5; font-size: 12px; margin-top: 16px; }
+  </style>
+</head>
+<body>
+  <div class="banner" id="banner">Offline — Stand wird geladen …</div>
+  <div class="wrap">
+    <h1>Kurse &amp; Schüler (letzter lokaler Stand)</h1>
+    <div id="liste"></div>
+    <p><button id="retry">Erneut verbinden</button></p>
+    <p class="hint">Nur-Lese-Ansicht. Änderungen sind offline nicht möglich.
+      Die App verbindet sich automatisch neu, sobald wieder Internet da ist.</p>
+  </div>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    function fmt(iso) {
+      try { return new Date(iso).toLocaleString('de-AT', { dateStyle: 'short', timeStyle: 'short' }); }
+      catch (_) { return iso; }
+    }
+    function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
+
+    async function laden() {
+      const data = await window.electronAPI.getOfflineData();
+      $('banner').textContent = data.stand
+        ? 'Offline — Stand vom ' + fmt(data.stand)
+        : 'Offline — kein lokaler Datenstand vorhanden';
+      if (!data.kurse.length) {
+        $('liste').innerHTML = '<p class="hint">Keine gecachten Kurse.</p>';
+        return;
+      }
+      $('liste').innerHTML = data.kurse.map((k) => `
+        <details class="kurs">
+          <summary>${esc(k.name)}<span class="n">${k.schueler.length} Schüler</span></summary>
+          <ul>${k.schueler.map((s) => `<li>${esc(s)}</li>`).join('') || '<li><i>keine</i></li>'}</ul>
+        </details>`).join('');
+    }
+
+    $('retry').addEventListener('click', () => window.electronAPI.retryNow());
+    laden();
+  </script>
+</body>
+</html>
