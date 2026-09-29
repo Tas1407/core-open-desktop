@@ -107,4 +107,15 @@ if (window.location.href.startsWith(APP_PREFIX)) {
   ipcRenderer.on('mvm-offline', (_e, d) => {
     if (document.body) showOfflineBanner(d && d.stand);
   });
+
+  // #578 SWR: Main hat einen gecachten Bereich im Hintergrund
+  // aufgefrischt und die Daten unterscheiden sich — als DOM-Event in
+  // die Hauptwelt reichen (contextIsolation: kein direkter Zugriff auf
+  // window.appShell, aber DOM-Events werden geteilt). Die App-Seite
+  // hoert darauf und rendert das aktive Modul weich nach.
+  ipcRenderer.on('mvm-swr', (_e, d) => {
+    try {
+      window.dispatchEvent(new CustomEvent('mvm-swr', { detail: d || {} }));
+    } catch (_) {}
+  });
 }

@@ -286,10 +286,39 @@ function startOfflineSync(reason) {
   }).finally(() => { syncRunning = false; });
 }
 
+// ── Stale-while-revalidate (#578) ──
+// Bereiche, deren Daten schon im Cache liegen, werden auch ONLINE
+// sofort aus dem Cache beantwortet — ohne auf den langsamen Host zu
+// warten. Parallel laeuft ein frischer Fetch im Hintergrund, der den
+// Cache-Eintrag auffrischt; hat sich der Inhalt wirklich geaendert,
+// bekommt der Renderer ein 'mvm-swr'-Event und rendert den Bereich
+// weich nach (appShell.refreshCurrentModule()).
+const revalidateStamp = new Map(); // key -> Zeitpunkt des letzten Hintergrund-Fetchs
+const REVALIDATE_MIN_MS = 1500;    // denselben Key nicht im Sekundentakt neu holen
+
+function swrRevalidate(req, key, oldBody) {
+  const last = revalidateStamp.get(key) || 0;
+  if (Date.now() - last < REVALIDATE_MIN_MS) return;
+  revalidateStamp.set(key, Date.now());
+  const bgReq = typeof req.clone === 'function' ? req.clone() : req;
+  net.fetch(bgReq, { bypassCustomProtocolHandlers: true })
+    .then(async (res) => {
+      if (!res.ok) return;
+      const text = await res.text();
+      if (text !== oldBody) {
+        offlineCache.put(key, text);
+        logUpdate('[swr] Daten geaendert: ' + key + ' — melde Renderer');
+        sendToPage('mvm-swr', { key: key, changed: true });
+      }
+    })
+    .catch(() => { /* Hintergrund-Fetch darf still scheitern */ });
+}
+
 /**
- * API-GETs der Web-App abfangen: online → normal durchreichen (und
- * bekannte Cache-Eintraege nebenbei auffrischen), offline/fehlgeschlagen
- * → aus dem Cache beantworten. Nur Lesen — andere Requests und alles
+ * API-GETs der Web-App abfangen: gecachte Eintraege → sofort aus dem
+ * Cache liefern + im Hintergrund auffrischen (SWR, #578); unbekannte
+ * Endpunkte online → normal durchreichen; offline/fehlgeschlagen →
+ * aus dem Cache beantworten. Nur Lesen — andere Requests und alles
  * ausserhalb von /web2app-ii/api/ gehen unangetastet durch.
  */
 function setupOfflineInterceptor() {
@@ -319,6 +348,16 @@ function setupOfflineInterceptor() {
     const key = u.pathname.slice(API_PREFIX.length - 'api/'.length) + u.search;
 
     if (!forceOffline) {
+      // SWR: schon im Cache → sofort antworten, frische Daten holt der
+      // Hintergrund-Fetch (siehe swrRevalidate). Kein Warten auf den Host.
+      const cached = offlineCache.get(key);
+      if (cached !== null) {
+        swrRevalidate(req, key, cached);
+        return new Response(cached, {
+          status: 200,
+          headers: { 'Content-Type': 'application/json; charset=utf-8', 'x-mvm-cache': 'stale' },
+        });
+      }
       try {
         const res = await net.fetch(req, { bypassCustomProtocolHandlers: true });
         // Read-through: schon gecachte Endpunkte online auffrischen
