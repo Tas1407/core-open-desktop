@@ -89,6 +89,12 @@ function showOfflineBanner(stand) {
   el.textContent = 'Offline — Stand vom ' + (stand ? fmtStand(stand) : 'unbekannt');
 }
 
+// #668: wieder online → Banner weg, ohne Reload
+function hideOfflineBanner() {
+  const el = document.getElementById('mvm-offline-banner');
+  if (el) el.remove();
+}
+
 if (window.location.href.startsWith(APP_PREFIX)) {
   window.addEventListener('DOMContentLoaded', injectStyles);
 
@@ -105,7 +111,9 @@ if (window.location.href.startsWith(APP_PREFIX)) {
   });
 
   ipcRenderer.on('mvm-offline', (_e, d) => {
-    if (document.body) showOfflineBanner(d && d.stand);
+    if (!document.body) return;
+    if (d && d.online) { hideOfflineBanner(); return; }  // #668
+    showOfflineBanner(d && d.stand);
   });
 
   // #578 SWR: Main hat einen gecachten Bereich im Hintergrund

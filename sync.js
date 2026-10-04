@@ -62,8 +62,16 @@ async function pool(items, concurrency, fn, onEach) {
  */
 async function syncKurseSchueler(onProgress) {
   const t0 = Date.now();
+  // #668: net.isOnline() liefert nach Netzwerkflaps gerne falsch-negativ
+  // (Chromiums Netzwerkmonitor braucht Zeit oder haengt). Statt blind
+  // abzubrechen: ein echter kurzer Probe-Request gegen den ersten
+  // Basis-Endpunkt entscheidet.
+  let probeResult = null;
   if (!net.isOnline()) {
-    return { ok: false, ms: 0, note: 'offline' };
+    probeResult = await fetchJson('api/courses.php?action=list', 8000);
+    if (!probeResult.ok) {
+      return { ok: false, ms: 0, note: 'offline' };
+    }
   }
   const entries = {};      // lokale Bühne — erst bei Erfolg in den Cache
   const prog = (phase, done, total, label) => {
@@ -88,7 +96,11 @@ async function syncKurseSchueler(onProgress) {
   const kursNamen = new Set();
 
   await pool(basis, 3, async (rel) => {
-    const r = await fetchJson(rel);
+    // Probe-Ergebnis wiederverwenden, sonst hat isOnline() gelogen UND
+    // wir verschwenden einen Roundtrip.
+    const r = (probeResult && rel === 'api/courses.php?action=list')
+      ? probeResult
+      : await fetchJson(rel);
     if (r.ok) {
       entries[keyOf(rel)] = { body: r.text, fetchedAt: new Date().toISOString() };
       try {

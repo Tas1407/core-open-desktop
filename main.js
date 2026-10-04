@@ -29,6 +29,35 @@ let syncRunning = false;
 let forceOffline = false;      // Test-Schalter (Menü/IPC): tut so, als gäbe es kein Netz
 let onOfflinePage = false;     // true, solange offline.html statt der App geladen ist
 let offlineRetryTimer = null;
+let offlineBannerShown = false; // Banner rausgeschickt? → spaeter wieder verstecken
+let closeWatchdog = null;      // #668: falls window.close() auf den Renderer wartet
+let unresponsiveTimer = null;  // #668: Renderer-Notbremse
+let probingOnline = false;
+
+// #668: net.fetch hat KEIN eingebautes Timeout — ein halbtoter TCP-
+// Socket (Netzwerkflap, Shared-Host-Hänger) blockiert den Request fuer
+// immer. Da ALLE https-Requests durch protocol.handle laufen, stapelt
+// sich so ein Haenger auf: Pool saettigt, Seite tot, Renderer wedged,
+// sogar das X wartet vergeblich aufs Unload-Handshake. Alles begrenzen:
+const FETCH_TIMEOUT_API_MS   = 20000;  // normale API-GETs
+const FETCH_TIMEOUT_POLL_MS  = 90000;  // Long-Polls (change-events) duerfen laenger offen stehen
+const FETCH_TIMEOUT_OTHER_MS = 60000;  // Pass-Through (Seiten, Assets)
+
+function fetchWithTimeout(req, ms) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  return net.fetch(req, { bypassCustomProtocolHandlers: true, signal: ctrl.signal })
+    .finally(() => clearTimeout(timer));
+}
+
+// #668: net.isOnline() liefert nach Netzwerkflaps gerne falsch-negativ.
+// Stattdessen ein echter kurzer Probe-Request gegen die App-URL.
+async function probeOnline() {
+  try {
+    const r = await fetchWithTimeout(APP_URL, 8000);
+    return r.ok;
+  } catch (_) { return false; }
+}
 
 // ── Update-Log in Datei (#243 Diagnose) ──
 // Schreibt alle [updater]-Events in eine Textdatei neben den App-Daten,
@@ -301,7 +330,7 @@ function swrRevalidate(req, key, oldBody) {
   if (Date.now() - last < REVALIDATE_MIN_MS) return;
   revalidateStamp.set(key, Date.now());
   const bgReq = typeof req.clone === 'function' ? req.clone() : req;
-  net.fetch(bgReq, { bypassCustomProtocolHandlers: true })
+  fetchWithTimeout(bgReq, FETCH_TIMEOUT_API_MS)
     .then(async (res) => {
       if (!res.ok) return;
       const text = await res.text();
@@ -324,7 +353,7 @@ function swrRevalidate(req, key, oldBody) {
 function setupOfflineInterceptor() {
   protocol.handle('https', async (req) => {
     let u;
-    try { u = new URL(req.url); } catch (_) { return net.fetch(req, { bypassCustomProtocolHandlers: true }); }
+    try { u = new URL(req.url); } catch (_) { return fetchWithTimeout(req, FETCH_TIMEOUT_OTHER_MS); }
 
     const isApiGet = req.method === 'GET'
       && u.hostname === 'www.mvm.school'
@@ -342,10 +371,13 @@ function setupOfflineInterceptor() {
         if (nav) setTimeout(showOfflinePage, 0);
         return new Response('offline (simuliert)', { status: 503 });
       }
-      return net.fetch(req, { bypassCustomProtocolHandlers: true });
+      return fetchWithTimeout(req, FETCH_TIMEOUT_OTHER_MS);
     }
 
     const key = u.pathname.slice(API_PREFIX.length - 'api/'.length) + u.search;
+    // #668: change-events-Long-Polls stehen serverseitig bewusst lange
+    // offen — die duerfen nicht am 20s-Standard-Timeout sterben.
+    const timeoutMs = /action=poll/.test(u.search) ? FETCH_TIMEOUT_POLL_MS : FETCH_TIMEOUT_API_MS;
 
     if (!forceOffline) {
       // SWR: schon im Cache → sofort antworten, frische Daten holt der
@@ -359,7 +391,13 @@ function setupOfflineInterceptor() {
         });
       }
       try {
-        const res = await net.fetch(req, { bypassCustomProtocolHandlers: true });
+        const res = await fetchWithTimeout(req, timeoutMs);
+        // #668: Netz lebt wieder — einen evtl. gezeigten Offline-Banner
+        // beim naechsten echten Treffer automatisch verstecken.
+        if (res.ok && offlineBannerShown) {
+          offlineBannerShown = false;
+          sendToPage('mvm-offline', { online: true });
+        }
         // Read-through: schon gecachte Endpunkte online auffrischen
         if (res.ok && offlineCache.has(key)) {
           res.clone().text()
@@ -368,7 +406,7 @@ function setupOfflineInterceptor() {
         }
         return res;
       } catch (e) {
-        logUpdate('[offline] Netzfehler bei ' + key + ' — versuche Cache');
+        logUpdate('[offline] Netzfehler/Timeout bei ' + key + ' — versuche Cache');
       }
     }
 
@@ -379,13 +417,16 @@ function setupOfflineInterceptor() {
       body = offlineCache.get('api/students.php?action=list');
     }
     if (body !== null) {
+      // #668: Banner nur wenn wirklich aus dem Cache geantwortet wird —
+      // ein einzelner missglückter Request (z.B. Long-Poll nach einem
+      // Netzwerkflap) darf NICHT global "Offline" anzeigen.
+      offlineBannerShown = true;
       sendToPage('mvm-offline', { stand: offlineCache.stand() });
       return new Response(body, {
         status: 200,
         headers: { 'Content-Type': 'application/json; charset=utf-8', 'x-mvm-cache': '1' },
       });
     }
-    sendToPage('mvm-offline', { stand: offlineCache.stand() });
     return new Response(JSON.stringify({ success: false, error: 'Offline — nicht im Lesecache', _offline: true }), {
       status: 503,
       headers: { 'Content-Type': 'application/json; charset=utf-8' },
@@ -401,8 +442,13 @@ function showOfflinePage() {
   logUpdate('[offline] Kein Netz — zeige offline.html (Stand ' + offlineCache.stand() + ')');
   mainWindow.loadFile(path.join(__dirname, 'offline.html'));
   if (!offlineRetryTimer) {
-    offlineRetryTimer = setInterval(() => {
-      if (net.isOnline() && onOfflinePage) maybeLeaveOfflinePage();
+    offlineRetryTimer = setInterval(async () => {
+      // #668: net.isOnline() luegt nach Flaps — echte Probe entscheidet.
+      if (!onOfflinePage || probingOnline) return;
+      probingOnline = true;
+      try {
+        if (await probeOnline()) maybeLeaveOfflinePage();
+      } finally { probingOnline = false; }
     }, 15000);
   }
 }
@@ -494,6 +540,41 @@ function createWindow() {
     }
   });
 
+  // #668: Das X darf sich NIEMALS an einem gewedgten Renderer festbeissen.
+  // window.close() wartet intern aufs Unload-Handshake des Renderers —
+  // haengt der (z.B. halbtote Netzwerkverbindung vor den Timeouts),
+  // reagiert auch das X nicht mehr. Watchdog erzwingt destroy().
+  mainWindow.on('close', () => {
+    if (closeWatchdog) return;
+    closeWatchdog = setTimeout(() => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        logUpdate('[app] Fenster-Close haengt >2,5s — Renderer wedged, erzwinge destroy()');
+        mainWindow.destroy();
+      }
+    }, 2500);
+  });
+
+  // #668: Haengt der Renderer komplett (unresponsive), laeuft nichts mehr —
+  // nach kurzer Gnadenfrist hart neu laden statt ewig zuzugucken.
+  mainWindow.webContents.on('unresponsive', () => {
+    logUpdate('[app] webContents unresponsive — reload in 4s falls nicht erholt');
+    if (unresponsiveTimer) clearTimeout(unresponsiveTimer);
+    unresponsiveTimer = setTimeout(() => {
+      unresponsiveTimer = null;
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        logUpdate('[app] Renderer weiter unresponsive — harter Reload');
+        try { mainWindow.webContents.reloadIgnoringCache(); } catch (_) {}
+      }
+    }, 4000);
+  });
+  mainWindow.webContents.on('responsive', () => {
+    if (unresponsiveTimer) {
+      clearTimeout(unresponsiveTimer);
+      unresponsiveTimer = null;
+      logUpdate('[app] Renderer erholt — Reload abgebrochen');
+    }
+  });
+
   // Externe Links im Standard-Browser öffnen, nicht im App-Fenster
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (url !== APP_URL && !url.startsWith(APP_URL)) {
@@ -505,6 +586,8 @@ function createWindow() {
 
   mainWindow.on('closed', () => {
     mainWindow = null;
+    if (closeWatchdog) { clearTimeout(closeWatchdog); closeWatchdog = null; }
+    if (unresponsiveTimer) { clearTimeout(unresponsiveTimer); unresponsiveTimer = null; }
   });
 }
 
