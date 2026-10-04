@@ -17,6 +17,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setRole: (role) => ipcRenderer.send('set-user-role', role),
   // Renderer → Main: Update-Check manuell auslösen
   checkForUpdates: () => ipcRenderer.send('check-for-updates'),
+  // #672: wie der Menüpunkt — mit garantiert sichtbarem Feedback
+  checkForUpdatesInteractive: () => ipcRenderer.send('manual-update-check'),
   // Offline-Lesecache
   onSync: (cb) => ipcRenderer.on('mvm-sync', (_e, d) => cb(d)),
   onOffline: (cb) => ipcRenderer.on('mvm-offline', (_e, d) => cb(d)),

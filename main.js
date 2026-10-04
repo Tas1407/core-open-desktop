@@ -216,7 +216,40 @@ ipcMain.on('check-for-updates', () => {
   });
 });
 
+// #672: interaktiver Check mit sichtbarem Feedback — derselbe Pfad wie
+// der Menüpunkt "Auf Update prüfen" (für Buttons in der Web-App).
+ipcMain.on('manual-update-check', () => {
+  manualUpdateCheck();
+});
+
 // ── Manueller Update-Check mit sichtbarem Feedback ──
+// #672: Feedback durfte NIE an window.cora.say haengen — ist die Web-App-
+// Funktion im Moment des Klicks nicht da (Seite laedt, Renderer wedged,
+// cora nicht gebootet), passierte sichtbar NICHTS, obwohl der Check lief.
+// Log zeigt: Tas klickte 3x, Check lief 3x, Antwort blieb unsichtbar.
+// Jetzt: cora.say wenn verfuegbar, sonst modal-Dialog — niemals stumm.
+function userFeedback(msg) {
+  const fallback = () => {
+    try {
+      dialog.showMessageBox(mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined, {
+        type: 'info',
+        title: WINDOW_TITLE,
+        message: msg,
+        buttons: ['OK'],
+      });
+    } catch (e) { logUpdate('[app] userFeedback-Fallback fehlgeschlagen: ' + e.message); }
+  };
+  if (!mainWindow || mainWindow.isDestroyed()) { fallback(); return; }
+  mainWindow.webContents.executeJavaScript(
+    `!!(window.cora && window.cora.say ? (window.cora.say(${JSON.stringify(msg)}, { showBar: false }), true) : false)`
+  ).then((said) => {
+    if (!said) {
+      logUpdate('[app] cora.say nicht verfuegbar — Dialog-Fallback');
+      fallback();
+    }
+  }).catch(() => { fallback(); });
+}
+
 let manualCheckInProgress = false;
 function manualUpdateCheck() {
   if (manualCheckInProgress) return;
@@ -224,49 +257,49 @@ function manualUpdateCheck() {
   logUpdate('[updater] Manueller Update-Check durch Menü…');
 
   // Sofort-Feedback: "Suche nach Updates..."
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.executeJavaScript(
-      `window.cora && window.cora.say ? window.cora.say('Suche nach Updates…', { showBar: false }) : null`
-    ).catch(() => {});
-  }
+  userFeedback('Suche nach Updates…');
+
+  // #672: Sicherheitsnetz — liefert der Updater weder Event noch Reject
+  // (kaputter Zustand, Dev-Modus-Skip), bleibt der Button sonst fuer
+  // immer "in Progress" und wirkt wieder tot.
+  const resultWatchdog = setTimeout(() => {
+    if (!manualCheckInProgress) return;
+    manualCheckInProgress = false;
+    autoUpdater.removeListener('update-available', onAvailable);
+    autoUpdater.removeListener('update-not-available', onNotAvailable);
+    autoUpdater.removeListener('error', onError);
+    logUpdate('[updater] Manuelles Check: kein Ergebnis nach 120s — Watchdog');
+    userFeedback('Update-Check brachte nach 2 Minuten kein Ergebnis — bitte App neu starten.');
+  }, 120000);
 
   // Einmalige Listener für dieses Check-Ergebnis
   const onAvailable = (info) => {
+    clearTimeout(resultWatchdog);
     autoUpdater.removeListener('update-available', onAvailable);
     autoUpdater.removeListener('update-not-available', onNotAvailable);
     autoUpdater.removeListener('error', onError);
     manualCheckInProgress = false;
     logUpdate('[updater] Manuelles Check: Update verfügbar ' + info.version);
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.executeJavaScript(
-        `window.cora && window.cora.say ? window.cora.say('Update v${info.version} verfügbar — wird heruntergeladen…', { showBar: false }) : null`
-      ).catch(() => {});
-    }
+    userFeedback(`Update v${info.version} verfügbar — wird heruntergeladen…`);
   };
   const onNotAvailable = (info) => {
+    clearTimeout(resultWatchdog);
     autoUpdater.removeListener('update-available', onAvailable);
     autoUpdater.removeListener('update-not-available', onNotAvailable);
     autoUpdater.removeListener('error', onError);
     manualCheckInProgress = false;
     const ver = (info && info.version) ? info.version : app.getVersion();
     logUpdate('[updater] Manuelles Check: Kein Update (aktuell ' + ver + ')');
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.executeJavaScript(
-        `window.cora && window.cora.say ? window.cora.say('Du hast bereits die neueste Version (${ver}).', { showBar: false }) : null`
-      ).catch(() => {});
-    }
+    userFeedback(`Du hast bereits die neueste Version (${ver}).`);
   };
   const onError = (err) => {
+    clearTimeout(resultWatchdog);
     autoUpdater.removeListener('update-available', onAvailable);
     autoUpdater.removeListener('update-not-available', onNotAvailable);
     autoUpdater.removeListener('error', onError);
     manualCheckInProgress = false;
     logUpdate('[updater] Manuelles Check: Fehler ' + (err && err.message ? err.message : String(err)));
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.executeJavaScript(
-        `window.cora && window.cora.say ? window.cora.say('Update-Check fehlgeschlagen: ${err && err.message ? err.message.replace(/'/g, "\\'") : 'Unbekannt'}', { showBar: false }) : null`
-      ).catch(() => {});
-    }
+    userFeedback(`Update-Check fehlgeschlagen: ${err && err.message ? err.message : 'Unbekannt'}`);
   };
   autoUpdater.on('update-available', onAvailable);
   autoUpdater.on('update-not-available', onNotAvailable);
@@ -278,6 +311,7 @@ function manualUpdateCheck() {
     autoUpdater.removeListener('update-not-available', onNotAvailable);
     autoUpdater.removeListener('error', onError);
     logUpdate('[updater] Manuelles Check: catch ' + (e && e.message ? e.message : String(e)));
+    userFeedback(`Update-Check fehlgeschlagen: ${e && e.message ? e.message : 'Unbekannt'}`);
   });
 }
 
