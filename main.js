@@ -8,7 +8,7 @@
  * lädt herunter, zeigt Badge, installiert beim Klick oder beim nächsten Start.
  * #243 Diagnose: Alle Updater-Events werden in update-log.txt geschrieben.
  */
-const { app, BrowserWindow, Menu, shell, Notification, ipcMain, dialog, protocol, net } = require('electron');
+const { app, BrowserWindow, Menu, shell, Notification, ipcMain, dialog, protocol, net, session } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { autoUpdater } = require('electron-updater');
@@ -609,8 +609,15 @@ function createWindow() {
     }
   });
 
-  // Externe Links im Standard-Browser öffnen, nicht im App-Fenster
+  // Externe Links im Standard-Browser öffnen, nicht im App-Fenster.
+  // #679: 'about:blank' ist KEIN externer Link — das ist die In-App-
+  // Druckvorschau (window.open('') + document.write, z.B. Leseverstehen).
+  // Wurde vorher geblockt + openExternal('about:blank') rief im
+  // System-Browser einen nutzlosen leeren Tab auf.
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (url === 'about:blank' || url.startsWith('about:blank')) {
+      return { action: 'allow' };
+    }
     if (url !== APP_URL && !url.startsWith(APP_URL)) {
       shell.openExternal(url);
       return { action: 'deny' };
@@ -735,6 +742,36 @@ function buildMenu() {
 app.whenReady().then(() => {
   // Offline-Lesecache: API-Interceptor muss vor dem ersten Request stehen
   setupOfflineInterceptor();
+
+  // #679: PDFs (z.B. hochgeladene Leseverstehen-Aufgaben) kann Electron
+  // nicht anzeigen — die Navigation im Popup laeuft in einen Download.
+  // Statt leerem Fenster: temporaer speichern, im System-PDF-Reader
+  // oeffnen (dort ist auch Drucken moeglich) und das leere Popup zu.
+  session.defaultSession.on('will-download', (_event, item, webContents) => {
+    const isPdf = item.getMimeType() === 'application/pdf'
+      || /\.pdf(\?|#|$)/i.test(item.getURL());
+    if (!isPdf) return;
+    const fname = item.getFilename() || 'dokument.pdf';
+    const tmp = path.join(app.getPath('temp'), `mvm-${Date.now()}-${fname}`);
+    item.setSavePath(tmp);
+    item.once('done', (_e, state) => {
+      if (state === 'completed') {
+        shell.openPath(tmp);
+      } else {
+        logUpdate(`[download] PDF-Download nicht abgeschlossen: ${state}`);
+      }
+    });
+    // webContents kann bei Navigations-Downloads null sein — dann das
+    // Popup-Fenster ueber die Download-URL finden.
+    const wc = webContents
+      || BrowserWindow.getAllWindows()
+          .map(w => w.webContents)
+          .find(c => {
+            try { return c.getURL() === item.getURL(); } catch (_) { return false; }
+          });
+    const win = wc ? BrowserWindow.fromWebContents(wc) : null;
+    if (win && win !== mainWindow && !win.isDestroyed()) win.close();
+  });
 
   buildMenu();
   createWindow();
