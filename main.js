@@ -549,6 +549,36 @@ function createWindow() {
 
   mainWindow.loadURL(APP_URL);
 
+  // #1483: Natives Rechtsklick-Kontextmenü — Electron liefert serienmäßig
+  // keins. Bilder bekommen "Bild speichern unter…" (loest einen Download
+  // mit Save-Dialog aus, siehe will-download-Handler unten), Textfelder
+  // die üblichen Bearbeiten-Einträge, markierter Text "Kopieren".
+  mainWindow.webContents.on('context-menu', (_e, params) => {
+    const tmpl = [];
+    if (params.mediaType === 'image' && params.srcURL) {
+      tmpl.push({
+        label: 'Bild speichern unter…',
+        click: () => {
+          try { mainWindow.webContents.downloadURL(params.srcURL); } catch (_) {}
+        },
+      });
+      tmpl.push({ type: 'separator' });
+    }
+    if (params.isEditable) {
+      tmpl.push(
+        { role: 'cut', label: 'Ausschneiden' },
+        { role: 'copy', label: 'Kopieren' },
+        { role: 'paste', label: 'Einfügen' },
+        { type: 'separator' },
+        { role: 'selectAll', label: 'Alles auswählen' },
+      );
+    } else if (params.selectionText) {
+      tmpl.push({ role: 'copy', label: 'Kopieren' });
+    }
+    if (!tmpl.length) return;
+    Menu.buildFromTemplate(tmpl).popup({ window: mainWindow });
+  });
+
   // Fenster erst zeigen wenn Inhalt geladen ist (vermeidet weißen Flash)
   mainWindow.once('ready-to-show', () => {
     mainWindow.show();
@@ -750,7 +780,18 @@ app.whenReady().then(() => {
   session.defaultSession.on('will-download', (_event, item, webContents) => {
     const isPdf = item.getMimeType() === 'application/pdf'
       || /\.pdf(\?|#|$)/i.test(item.getURL());
-    if (!isPdf) return;
+    if (!isPdf) {
+      // #1483: Bilder (z.B. aus dem neuen Kontextmenü "Bild speichern
+      // unter…") bekommen einen echten Save-Dialog statt dem stillen
+      // Download in den Standard-Ordner.
+      if ((item.getMimeType() || '').startsWith('image/')) {
+        dialog.showSaveDialog({ defaultPath: item.getFilename() || 'bild.png' }).then(r => {
+          if (r.canceled || !r.filePath) { item.cancel(); return; }
+          item.setSavePath(r.filePath);
+        }).catch(() => {});
+      }
+      return;
+    }
     const fname = item.getFilename() || 'dokument.pdf';
     const tmp = path.join(app.getPath('temp'), `mvm-${Date.now()}-${fname}`);
     item.setSavePath(tmp);
